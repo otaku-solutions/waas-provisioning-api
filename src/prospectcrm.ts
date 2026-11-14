@@ -5,8 +5,10 @@
 //   by the storefront.crm-prospects job (Provisioner.addCrmProspects). A storefront on its own website (such as the
 //   platform's own shop) gets them from the storefront.crm-prospects-host job, through its AnyPress Host
 //   (anypress-host/v1/prospects, signed like the support desk with the secret its webhook endpoint holds; Host 2.23.0+,
-//   which also keeps FluentCRM from emailing them). Either way they are tagged "Prospect" and "Prospect: <group>", with
-//   a note of what the finder found. A new contact is "transactional": no newsletter or campaign reaches someone who
+//   which also keeps FluentCRM from emailing them). Either way they are tagged "Prospect", with a note of what the
+//   finder found, and the group goes into the Customer Group field. A ready-made storefront also gets "Prospect: <group>",
+//   which its outreach queue starts automations by; an own-site storefront has no such queue, so it gets the field only
+//   (Host 2.24.0 also names the contact after its person, fills Job Title and Outreach Route, and makes a company). A new contact is "transactional": no newsletter or campaign reaches someone who
 //   never signed up. FluentCRM needs an email, so businesses without one are left out.
 // - HighLevel: the seller's own sub-account, through an Inbound Webhook workflow (the Sales Kit snapshot's). The API
 //   posts each business to its address; the workflow makes the contact. HighLevel sends any email itself.
@@ -38,6 +40,11 @@ export interface CrmProspect {
   reviews: number | null;
   hours: string[];
   socials: { network: (typeof NETWORKS)[number]; url: string }[];
+  /** The person who reads the inbox, when known (the contact is named after them instead of the business). */
+  person: string | null;
+  jobTitle: string | null;
+  /** The AnyPress programme the business is pitched, such as "Affiliate". */
+  route: string | null;
 }
 
 /** What the storefront knows from reading the business's website (src/prospectdemos.ts), when it read it. */
@@ -51,6 +58,7 @@ export interface CrmFacts {
 export interface CrmContact extends CrmProspect, Partial<CrmFacts> {
   email: string;
   tags: string[];
+  customerGroup: string | null;
 }
 
 export interface CrmSettings {
@@ -109,11 +117,17 @@ export function parseCrmProspect(raw: unknown): CrmProspect {
       .map((s) => ({ network: s.network as (typeof NETWORKS)[number], url: httpUrl(s.url) ?? '' }))
       .filter((s) => s.url)
       .slice(0, NETWORKS.length),
+    person: text(p.person, 150),
+    jobTitle: text(p.jobTitle, 150),
+    route: text(p.route, 40),
   };
 }
 
-/** Reads the dashboard's request: the businesses, the customer group they were found for, and which CRMs. */
-export function crmInput(body: unknown): { prospects: CrmProspect[]; group: string | null; targets: CrmTarget[] } {
+/**
+ * Reads the dashboard's request: the businesses, the customer group they were found for, which CRMs, and whether to send
+ * businesses FluentCRM already has again (to fill in what they were sent without).
+ */
+export function crmInput(body: unknown): { prospects: CrmProspect[]; group: string | null; targets: CrmTarget[]; resend: boolean } {
   const b = (body ?? {}) as Record<string, unknown>;
   const list = Array.isArray(b.prospects) ? b.prospects : [];
   if (!list.length) throw badRequest('Choose at least one business to add.');
@@ -122,7 +136,7 @@ export function crmInput(body: unknown): { prospects: CrmProspect[]; group: stri
   if (!targets.length) throw badRequest('Choose FluentCRM, HighLevel or both.');
   const prospects = list.map(parseCrmProspect);
   const unique = [...new Map(prospects.map((p) => [p.id, p])).values()];
-  return { prospects: unique, group: text(b.group, 80), targets: [...new Set(targets)] };
+  return { prospects: unique, group: text(b.group, 80), targets: [...new Set(targets)], resend: b.resend === true };
 }
 
 /** The tags a business gets: "Prospect", and "Prospect: <group>" when the seller searched for one. */
@@ -288,12 +302,14 @@ export async function addProspectsToCrm(deps: CrmDeps, productId: string, input:
     const { tenantId, host, reason } = await fluentCrmTarget(deps, productId);
     if (!tenantId && !host) result.fluentcrm.unavailable = reason;
     else {
-      const sent = await already('fluentcrm');
+      const sent = input.resend ? new Set<string>() : await already('fluentcrm');
+      // The own-site storefront has no outreach queue keyed on "Prospect: <group>": the group is a field there.
+      const fluentTags = tenantId ? tags : ['Prospect'];
       for (const p of input.prospects) {
         if (sent.has(p.id)) result.fluentcrm.already++;
         else if (!p.email) result.fluentcrm.noEmail++;
         else {
-          const contact: CrmContact = { ...p, ...facts.get(p.id), email: p.email, tags };
+          const contact: CrmContact = { ...p, ...facts.get(p.id), email: p.email, tags: fluentTags, customerGroup: input.group };
           await pool.query(
             `INSERT INTO prospect_crm (product_id, place_id, target, status, contact) VALUES ($1, $2, 'fluentcrm', $3, $4)
              ON CONFLICT (product_id, place_id, target) DO UPDATE SET status = EXCLUDED.status, contact = EXCLUDED.contact, error = NULL, date_changed = now()`,

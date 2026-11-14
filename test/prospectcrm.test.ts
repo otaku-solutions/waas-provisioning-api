@@ -192,8 +192,18 @@ describe("a storefront on its own website, through its AnyPress Host", () => {
     const call = calls[0]!;
     expect(call.url).toBe('https://shop.example/wp-json/anypress-host/v1/prospects');
     expect(call.headers['webhook-signature']).toBe(sign(SECRET, call.headers['webhook-id']!, Number(call.headers['webhook-timestamp']), call.body));
-    expect(JSON.parse(call.body).contacts[0]).toMatchObject({ id: 'p-grace', email: 'office@gracechurch.example', tags: ['Prospect', 'Prospect: Churches'] });
+    // No outreach queue on an own-site storefront: the group is a field, not a tag.
+    expect(JSON.parse(call.body).contacts[0]).toMatchObject({ id: 'p-grace', email: 'office@gracechurch.example', tags: ['Prospect'], customerGroup: 'Churches' });
     expect(((await (await ownAdd({ prospects: [grace], targets: ['fluentcrm'] })).json()) as any).fluentcrm).toMatchObject({ queued: 0, already: 1 });
+  });
+
+  it('sends a business again with resend, with the person, job title and route', async () => {
+    calls.length = 0;
+    const named = { ...grace, person: 'Dana Rivera', jobTitle: 'Office Manager', route: 'Affiliate' };
+    const body = (await (await ownAdd({ prospects: [named], group: 'Churches and Ministries', targets: ['fluentcrm'], resend: true })).json()) as any;
+    expect(body.fluentcrm).toMatchObject({ queued: 1, already: 0 });
+    await waitFor(async () => calls.length === 1);
+    expect(JSON.parse(calls[0]!.body).contacts[0]).toMatchObject({ id: 'p-grace', person: 'Dana Rivera', jobTitle: 'Office Manager', route: 'Affiliate', customerGroup: 'Churches and Ministries', tags: ['Prospect'] });
   });
 });
 
